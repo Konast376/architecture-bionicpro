@@ -1,5 +1,33 @@
 version: '3.8'
 
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+    AIRFLOW_CONN_CRM_DB: postgresql://crm_user:crm_password@crm_db:5432/crm
+    AIRFLOW_CONN_TELEMETRY_DB: postgresql://telemetry_user:telemetry_password@telemetry_db:5432/telemetry
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: '8123'
+    CLICKHOUSE_DATABASE: reports
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+  depends_on:
+    airflow_db:
+      condition: service_healthy
+    crm_db:
+      condition: service_healthy
+    telemetry_db:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+
 services:
   keycloak_db:
     image: postgres:14
@@ -8,9 +36,13 @@ services:
       POSTGRES_USER: keycloak_user
       POSTGRES_PASSWORD: keycloak_password
     volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
+      - keycloak_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak_user -d keycloak_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,23 +52,153 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
-      - start-dev
-      - --import-realm
+    command: ["start-dev", "--import-realm"]
     volumes:
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     ports:
       - "8080:8080"
     depends_on:
-      - keycloak_db
+      keycloak_db:
+        condition: service_healthy
+
+  crm_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+      - crm_data:/var/lib/postgresql/data
+      - ./sources/crm/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm_user -d crm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  telemetry_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry_user
+      POSTGRES_PASSWORD: telemetry_password
+    volumes:
+      - telemetry_data:/var/lib/postgresql/data
+      - ./sources/telemetry/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry_user -d telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_DB: reports
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  airflow_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow_init:
+    <<: *airflow-common
+    command: >
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Airflow --lastname Admin --role Admin --email admin@example.com || true"
+    restart: "no"
+
+  # One-shot startup ETL. It runs every time this Compose application is started.
+  airflow_startup_dag:
+    <<: *airflow-common
+    command: >
+      bash -c "set -e;
+      echo 'Waiting until bionicpro_reports_etl is visible to Airflow...';
+      until airflow dags list | grep -q '^bionicpro_reports_etl'; do sleep 2; done;
+      airflow dags unpause bionicpro_reports_etl || true;
+      echo 'Running startup ETL...';
+      airflow dags test bionicpro_reports_etl $$(date -u +%Y-%m-%dT%H:%M:%S);
+      echo 'Startup ETL finished successfully.'"
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  airflow_webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+
+  airflow_scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: '8123'
+      CLICKHOUSE_DATABASE: reports
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/reports-realm
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/reports-realm/protocol/openid-connect/certs
+      KEYCLOAK_CLIENT_ID: reports-frontend
+      FRONTEND_ORIGIN: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      airflow_startup_dag:
+        condition: service_completed_successfully
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
-    environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    depends_on:
+      - backend
+      - keycloak
+
+volumes:
+  keycloak_data:
+  crm_data:
+  telemetry_data:
+  clickhouse_data:
+  airflow_db_data:
